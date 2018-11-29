@@ -1,6 +1,5 @@
 /*
 Copyright IBM Corp. All Rights Reserved.
-
 SPDX-License-Identifier: Apache-2.0
 */
 
@@ -10,6 +9,11 @@ import (
 	"bytes"
 	"fmt"
 	"regexp"
+	"unicode/utf8"
+	"strconv"
+	"reflect"
+
+	"github.com/hyperledger/fabric/core/chaincode/platforms/ccmetadata"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric/common/channelconfig"
@@ -17,7 +21,6 @@ import (
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/core/chaincode/platforms"
 	"github.com/hyperledger/fabric/core/chaincode/platforms/car"
-	"github.com/hyperledger/fabric/core/chaincode/platforms/ccmetadata"
 	"github.com/hyperledger/fabric/core/chaincode/platforms/golang"
 	"github.com/hyperledger/fabric/core/chaincode/platforms/java"
 	"github.com/hyperledger/fabric/core/chaincode/platforms/node"
@@ -117,6 +120,178 @@ func (vscc *Validator) Validate(
 	if err != nil {
 		logger.Errorf("VSCC error: GetChaincodeActionPayload failed, err %s", err)
 		return policyErr(err)
+	}
+
+	pRespPayload, err := utils.GetProposalResponsePayload(cap.Action.ProposalResponsePayload)
+	if err != nil {
+		logger.Errorf("GetProposalResponsePayload error %s", err)
+		return policyErr(err)
+	}
+	if pRespPayload.Extension == nil {
+		logger.Errorf("nil pRespPayload.Extension")
+		return policyErr(err)
+	}
+	respPayload, err := utils.GetChaincodeAction(pRespPayload.Extension)
+	if err != nil {
+		logger.Errorf("GetChaincodeAction error %s", err)
+		return policyErr(err)
+	}
+
+	rwset := &rwsetutil.TxRwSet{}
+	if err := rwset.FromProtoBytes(respPayload.Results); err != nil {
+		return policyErr(errors.WithMessage(err, fmt.Sprintf("txRWSet.FromProtoBytes failed")))
+	}
+
+	qe, err := vscc.stateFetcher.FetchState()
+	if err != nil {
+		return policyErr(err)
+	}
+	defer qe.Done()
+
+	channelState := &state{qe}
+
+	for _, nsRWSet := range rwset.NsRwSets {
+		// skip other namespaces
+		if nsRWSet.NameSpace != namespace {
+			continue
+		}
+
+		// public writes
+		// we validate writes against key-level validation parameters
+		// if any are present or the chaincode-wide endorsement policy
+		for _, pubWrite := range nsRWSet.KvRwSet.Writes {
+			// split composite key
+			minChar := []byte{0x00}
+			splited := bytes.Split([]byte(pubWrite.Key), minChar)
+
+			if len(splited) > 3 {
+				address := string(minChar) + string(splited[1]) + string(minChar) + string(splited[2])
+				op := string(splited[3])
+				vals := string(splited[4])
+
+				val, _ := strconv.ParseFloat(vals, 64)
+				var finalValue float64
+
+				if op == "+" {
+					finalValue += val
+				} else {
+					finalValue -= val
+				}
+
+				iter, err := channelState.GetStateRangeScanIterator(namespace, address, address + string(utf8.MaxRune))
+
+				if err != nil || iter == nil {
+					return policyErr(fmt.Errorf("error before iteration"))
+				}
+				defer iter.Close()
+
+				for {
+					kv_, err := iter.Next()
+					if kv_ == nil || err != nil {
+						break
+					}
+
+					val := reflect.ValueOf(kv_)
+					key := val.Elem().Field(1).String()
+
+					KeyParts := bytes.Split([]byte(key), []byte{0x00})
+					operation := string(KeyParts[3])
+					valueStr := string(KeyParts[4])
+					value, _ := strconv.ParseFloat(valueStr,  64)
+
+					switch operation {
+					case "+":
+						finalValue += value
+					case "-":
+						finalValue -= value
+					default:
+						return policyErr(fmt.Errorf("Error with operation"))
+					}
+				}
+
+				// iterate through current block
+				for txPosIter := 0; txPosIter < txPosition; txPosIter++ {
+					// Get the envelope
+					envIter, err := utils.GetEnvelopeFromBlock(block.Data.Data[txPosIter])
+					if err != nil {
+						logger.Errorf("VSCC error: GetEnvelope failed, err %s", err)
+						return policyErr(err)
+					}
+
+
+					// ...and the payload...
+					paylIter, err := utils.GetPayload(envIter)
+					if err != nil {
+						logger.Errorf("VSCC error: GetPayload failed, err %s", err)
+						return policyErr(err)
+					}
+
+					// ...and the transaction...
+					txIter, err := utils.GetTransaction(paylIter.Data)
+					if err != nil {
+						logger.Errorf("VSCC error: GetTransaction failed, err %s", err)
+						return policyErr(err)
+					}
+
+					// set action position to 0
+					capIter, err := utils.GetChaincodeActionPayload(txIter.Actions[0].Payload)
+					if err != nil {
+						logger.Errorf("VSCC error: GetChaincodeActionPayload failed, err %s", err)
+						return policyErr(err)
+					}
+
+					pRespPayloadIter, err := utils.GetProposalResponsePayload(capIter.Action.ProposalResponsePayload)
+					if err != nil {
+						logger.Errorf("GetProposalResponsePayload error %s", err)
+						return policyErr(err)
+					}
+					if pRespPayloadIter.Extension == nil {
+						logger.Errorf("nil pRespPayload.Extension")
+						return policyErr(err)
+					}
+					respPayloadIter, err := utils.GetChaincodeAction(pRespPayloadIter.Extension)
+					if err != nil {
+						logger.Errorf("GetChaincodeAction error %s", err)
+						return policyErr(err)
+					}
+
+					rwsetIter := &rwsetutil.TxRwSet{}
+					if err := rwsetIter.FromProtoBytes(respPayloadIter.Results); err != nil {
+						return policyErr(errors.WithMessage(err, fmt.Sprintf("txRWSet.FromProtoBytes failed")))
+					}
+
+					for _, nsRWSetIter := range rwsetIter.NsRwSets {
+						if nsRWSetIter.NameSpace != namespace {
+							continue
+						}
+
+						for _, pubWriteIter := range nsRWSetIter.KvRwSet.Writes {
+							splitedIter := bytes.Split([]byte(pubWriteIter.Key), minChar)
+
+							if string(splitedIter[2]) == string(splited[2]) {
+								opIter := string(splitedIter[3])
+								valsIter := string(splitedIter[4])
+
+								valIter, _ := strconv.ParseFloat(valsIter, 64)
+
+								if opIter == "+" {
+									finalValue += valIter
+								} else {
+									finalValue -= valIter
+								}
+							}
+						}
+					}
+				}
+
+				if finalValue < 0 {
+					return policyErr(fmt.Errorf("final value less than 0"))
+				}
+
+			} else {
+				continue
+			}
+		}
 	}
 
 	signatureSet, err := vscc.deduplicateIdentity(cap)
